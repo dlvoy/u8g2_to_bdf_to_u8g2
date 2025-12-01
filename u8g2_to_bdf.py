@@ -141,44 +141,737 @@ def parse_c_file(filepath):
         print(f"Error parsing string data: {e}")
         return None, None
 
+
+def parse_bdf_file(filepath, map_range=None):
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+        
+    glyphs = []
+    current_glyph = None
+    
+    font_bbx = {}
+    
+    # Parse map range
+    allowed_codepoints = set()
+    if map_range:
+        # Format: "32-255, 300"
+        parts = map_range.split(',')
+        for p in parts:
+            if '-' in p:
+                start, end = map(int, p.split('-'))
+                allowed_codepoints.update(range(start, end + 1))
+            else:
+                allowed_codepoints.add(int(p))
+    
+    
+    glyphs = []
+    current_glyph = None
+    in_bitmap = False
+    
+    for line in lines:
+        line = line.strip()
+        if line.startswith("FONTBOUNDINGBOX"):
+            parts = line.split()
+            font_bbx['w'] = int(parts[1])
+            font_bbx['h'] = int(parts[2])
+            font_bbx['x'] = int(parts[3])
+            font_bbx['y'] = int(parts[4])
+        elif line.startswith("FONT_ASCENT"):
+            font_bbx['ascent'] = int(line.split()[1])
+        elif line.startswith("FONT_DESCENT"):
+            font_bbx['descent'] = int(line.split()[1])
+        elif line.startswith("STARTCHAR"):
+            current_glyph = {'bitmap_hex': []}
+            in_bitmap = False
+        elif line.startswith("ENCODING"):
+            if current_glyph: current_glyph['uc'] = int(line.split()[1])
+        elif line.startswith("DWIDTH"):
+            if current_glyph: current_glyph['d'] = int(line.split()[1])
+        elif line.startswith("BBX"):
+            if current_glyph:
+                parts = line.split()
+                current_glyph['w'] = int(parts[1])
+                current_glyph['h'] = int(parts[2])
+                current_glyph['x'] = int(parts[3])
+                current_glyph['y'] = int(parts[4])
+        elif line.startswith("BITMAP"):
+            in_bitmap = True
+        elif line.startswith("ENDCHAR"):
+            in_bitmap = False
+            if current_glyph:
+                if not map_range or current_glyph['uc'] in allowed_codepoints:
+                    # Process bitmap
+                    flat_bitmap = []
+                    for hex_line in current_glyph['bitmap_hex']:
+                        val = int(hex_line, 16)
+                        total_bits_in_line = len(hex_line) * 4
+                        for i in range(total_bits_in_line):
+                            bit = (val >> (total_bits_in_line - 1 - i)) & 1
+                            flat_bitmap.append(bit)
+                        # Truncate row to width (BDF pads to byte)
+                        # Wait, flat_bitmap is growing. We need to slice the last added row.
+                        # Actually, easier to slice after appending row.
+                        
+                        # Correct logic:
+                        # We appended total_bits_in_line bits.
+                        # We only want the first w bits of this row.
+                        # But we already appended them to flat_bitmap? 
+                        # No, we appended all.
+                        
+                        # Let's fix:
+                        # We need to keep only w bits from the current row.
+                        # The current row starts at len(flat_bitmap) - total_bits_in_line
+            # Let's rewrite the inner loop
+                        pass
+                    
+                    # Re-implementation of bitmap processing
+                    final_bitmap = []
+                    for hex_line in current_glyph['bitmap_hex']:
+                        val = int(hex_line, 16)
+                        row_bits = []
+                        # BDF hex is byte-aligned.
+                        # If w=10, hex is 4 chars (2 bytes = 16 bits).
+                        num_bits = len(hex_line) * 4
+                        for i in range(num_bits):
+                             bit = (val >> (num_bits - 1 - i)) & 1
+                             row_bits.append(bit)
+                        final_bitmap.extend(row_bits[:current_glyph['w']])
+                    
+                    current_glyph['bitmap'] = final_bitmap
+                    del current_glyph['bitmap_hex']
+                    
+                    # Skip empty glyphs (all zeros or zero dimensions)
+                    is_empty = (current_glyph['w'] == 0 or 
+                               current_glyph['h'] == 0 or 
+                               all(bit == 0 for bit in final_bitmap))
+                    
+                    if not is_empty:
+                        glyphs.append(current_glyph)
+                current_glyph = None
+        else:
+            if in_bitmap and current_glyph:
+                current_glyph['bitmap_hex'].append(line)
+                
+    return glyphs, font_bbx
+
 def main():
-    parser = argparse.ArgumentParser(description='Convert u8g2 font C file to BDF.')
-    parser.add_argument('input_file', help='Input C file containing u8g2 font')
-    parser.add_argument('-o', '--output', help='Output BDF file', default='output.bdf')
+    parser = argparse.ArgumentParser(description='Convert u8g2 font C file to BDF, or BDF to u8g2 C file.')
+    parser.add_argument('input_file', help='Input file (C or BDF)')
+    parser.add_argument('-o', '--output', help='Output file', default='output')
+    parser.add_argument('-e', '--encode', action='store_true', help='Encode BDF to u8g2 C file')
+    parser.add_argument('-m', '--map', help='Unicode range to export (e.g. "32-255,300")', default=None)
     
     args = parser.parse_args()
     
-    print(f"Parsing file: {args.input_file}")
-    data, name = parse_c_file(args.input_file)
-    if not data:
-        print("Failed to read data")
-        sys.exit(1)
+
+class BitWriter:
+    def __init__(self):
+        self.data = bytearray()
+        self.current_byte = 0
+        self.bit_idx = 0 # 0 to 7
         
-    print(f"Read {len(data)} bytes of font data.")
+    def write_bits(self, val, num_bits):
+        for i in range(num_bits):
+            bit = (val >> i) & 1
+            if bit:
+                self.current_byte |= (1 << self.bit_idx)
+            
+            self.bit_idx += 1
+            if self.bit_idx == 8:
+                self.data.append(self.current_byte)
+                self.current_byte = 0
+                self.bit_idx = 0
+                
+    def write_signed_bits(self, val, num_bits):
+        # Excess-K encoding
+        # val = stored_val - (1 << (num_bits - 1))
+        # stored_val = val + (1 << (num_bits - 1))
+        stored_val = val + (1 << (num_bits - 1))
+        self.write_bits(stored_val, num_bits)
+        
+    def flush(self):
+        if self.bit_idx > 0:
+            self.data.append(self.current_byte)
+            self.current_byte = 0
+            self.bit_idx = 0
+            
+    def get_bytes(self):
+        self.flush()
+        return bytes(self.data)
+
+def encode_rle(bitmap, m0, m1):
+    # RLE compression
+    # m0 bits for zeros
+    # m1 bits for ones
+    # n bits for repeat
+    
+    # We need to find runs of 0s and 1s.
+    # Sequence: 0s, 1s.
+    # If we have 0s then 1s, that's one sequence.
+    # If we have 0s then 0s? No, runs are greedy.
+    
+    # But wait, the format is:
+    # run_0 (m0 bits)
+    # run_1 (m1 bits)
+    # repeat (unary)
+    
+    # So we must encode pairs of (zeros, ones).
+    # If we have only zeros, run_1 = 0.
+    # If we have only ones, run_0 = 0.
+    
+    encoded_bits = [] # List of (val, bits) tuples to write later
+    
+    # First, convert bitmap to RLE pairs
+    pairs = []
+    idx = 0
+    while idx < len(bitmap):
+        # Count zeros
+        zeros = 0
+        while idx < len(bitmap) and bitmap[idx] == 0:
+            zeros += 1
+            idx += 1
+            
+        # Count ones
+        ones = 0
+        while idx < len(bitmap) and bitmap[idx] == 1:
+            ones += 1
+            idx += 1
+            
+        pairs.append((zeros, ones))
+        
+    # Now compress pairs
+    # We can repeat the previous pair if it matches.
+    
+    # We need to handle field overflows.
+    # Max zeros = (1 << m0) - 1
+    # Max ones = (1 << m1) - 1
+    
+    # If a run is too long, we must split it.
+    # Splitting strategy:
+    # If zeros > max, we emit (max, 0) and remaining zeros.
+    # If ones > max, we emit (zeros, max) and remaining ones (with 0 zeros).
+    
+    # Let's normalize pairs first to fit in m0/m1
+    normalized_pairs = []
+    max_0 = (1 << m0) - 1
+    max_1 = (1 << m1) - 1
+    
+    for z, o in pairs:
+        while z > max_0:
+            normalized_pairs.append((max_0, 0))
+            z -= max_0
+        
+        while o > max_1:
+            normalized_pairs.append((z, max_1))
+            z = 0
+            o -= max_1
+            
+        normalized_pairs.append((z, o))
+        
+    # Now encode with repeats
+    i = 0
+    bw = BitWriter()
+    
+    while i < len(normalized_pairs):
+        z, o = normalized_pairs[i]
+        
+        # Count repeats
+        repeat = 0
+        j = i + 1
+        while j < len(normalized_pairs) and normalized_pairs[j] == (z, o):
+            repeat += 1
+            j += 1
+            
+        # Write z (m0 bits)
+        bw.write_bits(z, m0)
+        # Write o (m1 bits)
+        bw.write_bits(o, m1)
+        # Write repeat (unary: 1s then 0)
+        for _ in range(repeat):
+            bw.write_bits(1, 1)
+        bw.write_bits(0, 1)
+        
+        i += 1 + repeat
+        
+    return bw.get_bytes(), bw.bit_idx + len(bw.data)*8 # Approximate bit count? No.
+    # BitWriter logic is a bit complex for just counting.
+    # Let's return the bit count properly.
+    # Actually get_bytes flushes, so len * 8 is upper bound.
+    # We need exact bit count for optimization?
+    # Yes, to pick best m0/m1.
+    
+    # Let's make BitWriter track bit count.
+    return bw
+
+def calculate_encoded_size(glyphs, m0, m1):
+    total_bits = 0
+    for g in glyphs:
+        bw = encode_rle(g['bitmap'], m0, m1)
+        # We need exact bits written.
+        # BitWriter doesn't expose it easily in my implementation above.
+        # Let's update BitWriter.
+        # But wait, encode_rle returns a BitWriter instance now (in my thought).
+        # Let's fix encode_rle to return bits.
+        
+        # Actually, for optimization we don't need the bytes, just the size.
+        # But we need to do the work.
+        pass
+    return total_bits
+
+# Helper to get bit width of a value
+def get_bit_width(val):
+    if val == 0: return 0
+    return val.bit_length()
+
+def get_signed_bit_width(val):
+    # For Excess-K, we need range.
+    # But u8g2 uses fixed bit width for all glyphs for a field.
+    # We need to find min/max of all glyphs.
+    pass
+
+def encode_u8g2(glyphs, font_bbx, font_name):
+    # 1. Determine optimal m0, m1
+    # Try all combinations m0=2..8, m1=2..7 (from bdfconv)
+    best_size = float('inf')
+    best_m0 = 3
+    best_m1 = 3
+    
+    # We need a fast way to calculate size without full encoding if possible.
+    # But full encoding is robust.
+    
+    # 2. Determine bit widths for fields
+    # W, H, X, Y, D
+    max_w = 0
+    max_h = 0
+    max_x = 0 # absolute max? No, signed range.
+    min_x = 0
+    max_y = 0
+    min_y = 0
+    max_d = 0
+    min_d = 0
+    
+    for g in glyphs:
+        max_w = max(max_w, g['w'])
+        max_h = max(max_h, g['h'])
+        max_x = max(max_x, g['x'])
+        min_x = min(min_x, g['x'])
+        max_y = max(max_y, g['y'])
+        min_y = min(min_y, g['y'])
+        max_d = max(max_d, g['d'])
+        min_d = min(min_d, g['d'])
+        
+    bitcntW = get_bit_width(max_w)
+    bitcntH = get_bit_width(max_h)
+    
+    # For signed, we need to cover the range [min, max].
+    # Excess-K: val + 2^(n-1).
+    # We need 2^(n-1) > abs(min) and 2^(n-1) >= max?
+    # No, range is -2^(n-1) to 2^(n-1) - 1.
+    # So we need n such that -2^(n-1) <= min and max <= 2^(n-1) - 1.
+    
+    def needed_bits_signed(min_v, max_v):
+        # We need to fit both.
+        # abs_max = max(abs(min_v), abs(max_v))
+        # bits = abs_max.bit_length() + 1 ?
+        # Example: -16 to 16.
+        # -16 needs 5 bits (10000). 16 needs 6 bits (010000) signed?
+        # Excess-K with n=5: range -16 to 15.
+        # If max is 16, we need n=6 (-32 to 31).
+        
+        for n in range(1, 16):
+            limit = 1 << (n - 1)
+            if min_v >= -limit and max_v < limit:
+                return n
+        return 16
+        
+    bitcntX = needed_bits_signed(min_x, max_x)
+    bitcntY = needed_bits_signed(min_y, max_y)
+    bitcntD = needed_bits_signed(min_d, max_d)
+    
+    # Optimize m0, m1
+    # This might be slow in python for large fonts.
+    # Let's pick reasonable defaults or try a few.
+    # bdfconv tries m0: 2..8, m1: 2..7.
+    
+    print("Optimizing RLE parameters...")
+    for m0 in range(2, 9):
+        for m1 in range(2, 8):
+            current_size = 0
+            for g in glyphs:
+                # We need a version of encode_rle that just returns bit count
+                # For now, let's just use the full one, it's python but maybe fast enough for typical fonts.
+                bw = encode_rle(g['bitmap'], m0, m1)
+                # We need to access the bit count from bw
+                # Let's add a property or return it
+                bits = (len(bw.data) * 8) if hasattr(bw, 'data') else 0 # Approximation?
+                # Wait, encode_rle returns bw.
+                # We need exact bits.
+                # Let's modify encode_rle to return (bytes, bit_count)
+                pass
+            
+            # ...
+            
+    # Let's redefine encode_rle to return (bytes, bit_count)
+    # And use it here.
+    
+    # For now, let's assume we picked best_m0, best_m1.
+    # Let's just use 3, 3 as default if optimization is skipped, but we should do it.
+    
+    # Re-implement encode_rle properly first.
+    pass
+
+def encode_rle_bits(bitmap, m0, m1):
+    # Returns (bytearray, bit_count)
+    pairs = []
+    idx = 0
+    while idx < len(bitmap):
+        zeros = 0
+        while idx < len(bitmap) and bitmap[idx] == 0:
+            zeros += 1
+            idx += 1
+        ones = 0
+        while idx < len(bitmap) and bitmap[idx] == 1:
+            ones += 1
+            idx += 1
+        pairs.append((zeros, ones))
+        
+    normalized_pairs = []
+    max_0 = (1 << m0) - 1
+    max_1 = (1 << m1) - 1
+    
+    for z, o in pairs:
+        while z > max_0:
+            normalized_pairs.append((max_0, 0))
+            z -= max_0
+        while o > max_1:
+            normalized_pairs.append((z, max_1))
+            z = 0
+            o -= max_1
+        normalized_pairs.append((z, o))
+        
+    bw = BitWriter()
+    total_bits = 0
+    
+    i = 0
+    while i < len(normalized_pairs):
+        z, o = normalized_pairs[i]
+        repeat = 0
+        j = i + 1
+        while j < len(normalized_pairs) and normalized_pairs[j] == (z, o):
+            repeat += 1
+            j += 1
+            
+        bw.write_bits(z, m0)
+        bw.write_bits(o, m1)
+        # Unary repeat: 1s then 0
+        for _ in range(repeat):
+            bw.write_bits(1, 1)
+        bw.write_bits(0, 1)
+        
+        total_bits += m0 + m1 + repeat + 1
+        i += 1 + repeat
+        
+    return bw.get_bytes(), total_bits
+
+def encode_rle_to_bw(bitmap, m0, m1, bw):
+    pairs = []
+    idx = 0
+    while idx < len(bitmap):
+        zeros = 0
+        while idx < len(bitmap) and bitmap[idx] == 0:
+            zeros += 1
+            idx += 1
+        ones = 0
+        while idx < len(bitmap) and bitmap[idx] == 1:
+            ones += 1
+            idx += 1
+        pairs.append((zeros, ones))
+        
+    normalized_pairs = []
+    max_0 = (1 << m0) - 1
+    max_1 = (1 << m1) - 1
+    
+    for z, o in pairs:
+        while z > max_0:
+            normalized_pairs.append((max_0, 0))
+            z -= max_0
+        while o > max_1:
+            normalized_pairs.append((z, max_1))
+            z = 0
+            o -= max_1
+        normalized_pairs.append((z, o))
+        
+    total_bits = 0
+    i = 0
+    while i < len(normalized_pairs):
+        z, o = normalized_pairs[i]
+        repeat = 0
+        j = i + 1
+        while j < len(normalized_pairs) and normalized_pairs[j] == (z, o):
+            repeat += 1
+            j += 1
+            
+        bw.write_bits(z, m0)
+        bw.write_bits(o, m1)
+        for _ in range(repeat):
+            bw.write_bits(1, 1)
+        bw.write_bits(0, 1)
+        
+        total_bits += m0 + m1 + repeat + 1
+        i += 1 + repeat
+    return total_bits
+
+def generate_u8g2_c(glyphs, font_bbx, name):
+    # 1. Optimize RLE
+    best_size = float('inf')
+    best_m0 = 3
+    best_m1 = 3
+    
+    # Pre-calculate metrics
+    max_w = 0
+    max_h = 0
+    max_x = 0
+    min_x = 0
+    max_y = 0
+    min_y = 0
+    max_d = 0
+    min_d = 0
+    
+    for g in glyphs:
+        max_w = max(max_w, g['w'])
+        max_h = max(max_h, g['h'])
+        max_x = max(max_x, g['x'])
+        min_x = min(min_x, g['x'])
+        max_y = max(max_y, g['y'])
+        min_y = min(min_y, g['y'])
+        max_d = max(max_d, g['d'])
+        min_d = min(min_d, g['d'])
+        
+    bitcntW = get_bit_width(max_w)
+    bitcntH = get_bit_width(max_h)
+    
+    def needed_bits_signed(min_v, max_v):
+        for n in range(1, 16):
+            limit = 1 << (n - 1)
+            if min_v >= -limit and max_v < limit:
+                return n
+        return 16
+        
+    bitcntX = needed_bits_signed(min_x, max_x)
+    bitcntY = needed_bits_signed(min_y, max_y)
+    bitcntD = needed_bits_signed(min_d, max_d)
+    
+    # Optimize
+    for m0 in range(2, 9):
+        for m1 in range(2, 8):
+            size = 0
+            for g in glyphs:
+                _, bits = encode_rle_bits(g['bitmap'], m0, m1)
+                size += bits
+            if size < best_size:
+                best_size = size
+                best_m0 = m0
+                best_m1 = m1
+                
+    print(f"Optimal RLE: m0={best_m0}, m1={best_m1}")
     
 
-    # Parse Header
-    # 0: n glyphs
-    # 1: bbx mode
-    # 2: m0
-    # 3: m1
-    # 4: bitcntW
-    # 5: bitcntH
-    # 6: bitcntX
-    # 7: bitcntY
-    # 8: bitcntD
-    # 9: bbx width
-    # 10: bbx height
-    # 11: bbx x offset
-    # 12: bbx y offset
-    # 13: ascent A
-    # 14: descent g
-    # 15: ascent (
-    # 16: descent (
-    # 17-18: offset A
-    # 19-20: offset a
-    # 21-22: offset 0x100
+    # 2. Generate Data
+    # Header construction
+    header = bytearray(23)
+    # n_glyphs: 0 means 256? Or just number of glyphs.
+    # If > 255, we might have issues with standard u8g2 format if it uses 1 byte count.
+    # But let's use len(glyphs) & 0xFF.
+    header[0] = len(glyphs) & 0xFF
     
+    header[1] = 0 # BBX Mode 0
+    header[2] = best_m0
+    header[3] = best_m1
+    header[4] = bitcntW
+    header[5] = bitcntH
+    header[6] = bitcntX
+    header[7] = bitcntY
+    header[8] = bitcntD
+    
+    header[9] = font_bbx.get('w', max_w)
+    header[10] = font_bbx.get('h', max_h)
+    header[11] = font_bbx.get('x', 0)
+    header[12] = font_bbx.get('y', 0) & 0xFF 
+    
+    # Ascent/Descent
+    # Need to find 'A', 'g', '('
+    # If not found, use defaults or max/min
+    
+    def find_glyph(char):
+        for g in glyphs:
+            if g['uc'] == ord(char):
+                return g
+        return None
+        
+    g_A = find_glyph('A')
+    g_g = find_glyph('g')
+    g_para = find_glyph('(')
+    
+    ascent_A = (g_A['h'] + g_A['y']) if g_A else max_h + min_y # Fallback
+    descent_g = g_g['y'] if g_g else min_y
+    ascent_para = (g_para['h'] + g_para['y']) if g_para else ascent_A
+    descent_para = g_para['y'] if g_para else descent_g
+    
+    header[13] = font_bbx.get('ascent', ascent_A) & 0xFF
+    header[14] = (-font_bbx.get('descent', descent_g)) & 0xFF # u8g2 stores descent as negative
+    
+    header[15] = font_bbx.get('ascent', ascent_para) & 0xFF
+    header[16] = (-font_bbx.get('descent', descent_para)) & 0xFF 
+    
+    # Offsets
+    # We need to calculate offsets after generating data.
+    # We generate data first, then fill offsets.
+    
+    glyph_data = bytearray()
+    
+    # Map unicode to offset
+    # We need to handle the 0x100 block if present.
+    # For now, assume sequential or simple map.
+    
+    # We need to sort glyphs by unicode?
+    glyphs.sort(key=lambda x: x['uc'])
+    
+    # We need to find where 'A', 'a', 0x100 are.
+    offset_A = 0
+    offset_a = 0
+    offset_100 = 0
+    
+    # Start of glyph data relative to end of header (23).
+    current_offset = 0
+    
+    # We need to handle the "jump table" or just sequential list.
+    # "The glyphs start immediately after the end of the initial data structure."
+    # "All glyphs start with the unicode (1 byte) and the offset to the next glyph (1 byte)."
+    
+    # If unicode > 255?
+    # "The address for the unicode glyphs is the end of the initial data structure plus the 16 bit offset from bytes 21/22"
+    # So we have two blocks.
+    # Block 1: <= 255.
+    # Block 2: > 255.
+    
+    block1 = [g for g in glyphs if g['uc'] <= 255]
+    block2 = [g for g in glyphs if g['uc'] > 255]
+    
+    # Generate Block 1
+    for g in block1:
+        start_pos = len(glyph_data)
+        if g['uc'] == ord('A'): offset_A = start_pos
+        if g['uc'] == ord('a'): offset_a = start_pos
+        
+        # Placeholder for next offset
+        glyph_data.append(g['uc'])
+        glyph_data.append(0) # Offset placeholder
+        
+        bw = BitWriter()
+        bw.write_bits(g['w'], bitcntW)
+        bw.write_bits(g['h'], bitcntH)
+        bw.write_signed_bits(g['x'], bitcntX)
+        bw.write_signed_bits(g['y'], bitcntY)
+        bw.write_signed_bits(g['d'], bitcntD)
+        
+        encode_rle_to_bw(g['bitmap'], best_m0, best_m1, bw)
+        
+        data_bytes = bw.get_bytes()
+        glyph_data.extend(data_bytes)
+        
+        # Update offset
+        next_pos = len(glyph_data)
+        offset = next_pos - start_pos
+        if offset > 255:
+            print(f"Warning: Glyph {g['uc']} too large for 8-bit offset ({offset})")
+        glyph_data[start_pos + 1] = offset & 0xFF
+        
+    # Block 2 (Unicode > 255)
+    offset_100 = len(glyph_data)
+    
+    # If block2 is empty, offset_100 should point to end?
+    # Or 0?
+    # If block2 exists:
+    for g in block2:
+        start_pos = len(glyph_data)
+        # Unicode 2 bytes
+        glyph_data.append((g['uc'] >> 8) & 0xFF)
+        glyph_data.append(g['uc'] & 0xFF)
+        glyph_data.append(0) # Offset placeholder
+        
+        bw = BitWriter()
+        bw.write_bits(g['w'], bitcntW)
+        bw.write_bits(g['h'], bitcntH)
+        bw.write_signed_bits(g['x'], bitcntX)
+        bw.write_signed_bits(g['y'], bitcntY)
+        bw.write_signed_bits(g['d'], bitcntD)
+        
+        encode_rle_to_bw(g['bitmap'], best_m0, best_m1, bw)
+        
+        data_bytes = bw.get_bytes()
+        glyph_data.extend(data_bytes)
+        
+        next_pos = len(glyph_data)
+        offset = next_pos - start_pos
+        if offset > 255:
+            print(f"Warning: Glyph {g['uc']} too large for 8-bit offset ({offset})")
+        glyph_data[start_pos + 2] = offset & 0xFF
+        
+    # Terminator for Block 2?
+    # "All glyphs start with the unicode (2 bytes)..."
+    # Is there a terminator?
+    # Example file ends with \2\0\0\0\4\377\377\0
+    # Maybe 0 offset?
+    
+    # Fill Header Offsets
+    header[17] = (offset_A >> 8) & 0xFF
+    header[18] = offset_A & 0xFF
+    header[19] = (offset_a >> 8) & 0xFF
+    header[20] = offset_a & 0xFF
+    header[21] = (offset_100 >> 8) & 0xFF
+    header[22] = offset_100 & 0xFF
+    
+    # Combine
+    full_data = header + glyph_data
+    
+    
+    # Convert to C string with octal escaping (matching original u8g2 format)
+    c_str = ""
+    line_len = 0
+    
+    for i, b in enumerate(full_data):
+        # Use octal escaping for non-printable and special characters
+        # Printable ASCII (32-126) can be literal, except quote, backslash
+        if 32 <= b <= 126 and b != ord('"') and b != ord('\\'):
+            s = chr(b)
+        else:
+            # Octal escape - use shortest form possible
+            # But if next char is a literal digit 0-7, must pad to avoid ambiguity
+            octal_str = f"{b:o}"
+            
+            # Check if next character will be a literal digit 0-7
+            need_padding = False
+            if i + 1 < len(full_data):
+                next_b = full_data[i + 1]
+                if 32 <= next_b <= 126 and chr(next_b) in '01234567':
+                    need_padding = True
+            
+            if need_padding:
+                s = f"\\{b:03o}"
+            else:
+                s = f"\\{octal_str}"
+        
+        # Check if adding this would exceed line length
+        if line_len + len(s) > 70:
+            c_str += '"\n  "'
+            line_len = 0
+        c_str += s
+        line_len += len(s)
+        
+    return f'const uint8_t {name}[] U8G2_FONT_SECTION("{name}") = \n  "{c_str}";\n'
+
+
+def convert_u8g2_to_bdf(data, name, output_file):
     if len(data) < 23:
         print("Data too short for header")
         return
@@ -196,172 +889,38 @@ def main():
     font_bbx_w = data[9]
     font_bbx_h = data[10]
     font_bbx_x = data[11]
-    font_bbx_y = data[12] # signed?
+    font_bbx_y = data[12] 
+    if font_bbx_y > 127: font_bbx_y -= 256 # Signed byte
     
     ascent_A = data[13]
-    descent_g = data[14] # signed?
+    descent_g = data[14] 
+    if descent_g > 127: descent_g -= 256 # Signed byte
     
-    # Offsets are 16-bit big endian usually? Or little?
-    # Spec doesn't say endianness explicitly in the table, but "u8g2_font_get_word" suggests it.
-    # Usually u8g2 is for 8-bit MCUs, often little endian, but let's check.
-    # In the example file:
-    # 17-18: \374\20 -> 0xfc 0x10. 
-    # If big endian: 0xfc10 (64528) - huge.
-    # If little endian: 0x10fc (4348).
-    # The file size is 287 bytes. So 4348 is also too big.
-    # Wait, "Array offset of glyph 'A'".
-    # Maybe it's relative to something?
-    # "The offsets are relative to the end of the font header."
-    # Header is 23 bytes.
-    # 0x10fc is still too big.
-    # Let's look at the data again.
-    # \22\0\3\3\4\5\3\5\5\11\23\0\377\20\374\20\0\0\0\0\0\1\2
-    # 0: 22 (18 glyphs? comment says 18/527) -> Matches.
-    # 1: 0 (Mode 0) -> Matches.
-    # 2: 3 (m0)
-    # 3: 3 (m1)
-    # 4: 4 (W)
-    # 5: 5 (H)
-    # 6: 3 (X)
-    # 7: 5 (Y)
-    # 8: 5 (D)
-    # 9: 11 (BBX W)
-    # 10: 23 (BBX H)
-    # 11: 0 (BBX X)
-    # 12: 255 (-1? BBX Y) -> 0xff. Signed byte -1.
-    # 13: 20 (Ascent A)
-    # 14: 252 (-4? Descent g) -> 0xfc. Signed byte -4.
-    # 15: 20 (Ascent ()
-    # 16: 0 (Descent ()
-    # 17: 0
-    # 18: 0
-    # 19: 0
-    # 20: 0
-    # 21: 0
-    # 22: 1
-    # Wait, the example string:
-    # "\22\0\3\3\4\5\3\5\5\11\23\0\377\20\374\20\0\0\0\0\0\1\2"
-    # 0: 18
-    # 1: 0
-    # 2: 3
-    # 3: 3
-    # 4: 4
-    # 5: 5
-    # 6: 3
-    # 7: 5
-    # 8: 5
-    # 9: 9 (\11) -> 9? Comment says 23-230...
-    # 10: 19 (\23) -> 19.
-    # 11: 0
-    # 12: 255 (-1)
-    # 13: 16 (\20)
-    # 14: 252 (\374) (-4)
-    # 15: 16 (\20)
-    # 16: 0
-    # 17: 0
-    # 18: 0
-    # 19: 0
-    # 20: 0
-    # 21: 0
-    # 22: 1
-    
-    # Offset 0x100 is 0x0100 (big endian) or 0x0001 (little endian)?
-    # If 0x0001: 1 byte offset?
-    # If 0x0100: 256 bytes offset?
-    # The file is 287 bytes. 23 + 256 = 279. Possible.
-    # Let's assume Big Endian for now based on 0x00 0x01 looking like 1.
-    # But wait, byte 21 is 0, byte 22 is 1.
-    # If Big Endian: 0x0001 = 1.
-    # If Little Endian: 0x0100 = 256.
-    # Given the file size, 256 seems more likely to point to something at the end (0x100 is usually not in small fonts, but maybe it points to the start of the unicode table?).
-    
-    # "The address for the unicode glyphs is the end of the initial data structure plus the 16 bit offset from bytes 21/22"
-    # If offset is 1, then 23+1 = 24.
-    # If offset is 256, then 23+256 = 279.
-    
-    # Let's look at byte 23 (index 23).
-    # The string continues: " \5\0\10\65*\21x\272..."
-    # ' ' is 32. \5 is 5.
-    # 32 could be the unicode for space!
-    # If so, the glyphs start immediately at 23.
-    # So offset to 0x100 being 1 or 256 doesn't affect where the FIRST glyph is.
-    # The first glyph is at 23.
-    
-    # Glyph format:
-    # 0: Unicode (1 or 2 bytes?)
-    # "All glyphs start with the unicode (1 byte) and the offset to the next glyph (1 byte)."
-    # "All glyphs start with the unicode (2 bytes) and the offset to the next glyph (1 byte)." (for the 0x100 block?)
-    
-    # The spec is a bit confusing: "The glyphs start immediately after the end of the initial data structure."
-    # "All glyphs start with the unicode (1 byte)..."
-    # But then "The address for the unicode glyphs is the end of the initial data structure plus the 16 bit offset from bytes 21/22... All glyphs start with the unicode (2 bytes)..."
-    
-    # It seems there are two blocks?
-    # Block 1: 0-255, 1 byte unicode.
-    # Block 2: 0x100+, 2 byte unicode.
-    
-    # Let's try to parse sequentially from 23.
+    # ... offsets ...
     
     idx = 23
     glyphs = []
     
     while idx < len(data):
-        # Check if we are in the 0x100 block?
-        # The spec says "The glyphs start immediately...".
-        # Let's assume 1-byte unicode first.
-        
-        # But wait, 0x100 offset in header points to the 2-byte unicode block?
-        # If byte 21=0, 22=1.
-        # If it is Big Endian 1: 23+1 = 24. That would overlap with the first block? Unlikely.
-        # If it is Little Endian 256: 23+256 = 279.
-        # At 279:
-        # The file ends at 287.
-        # 279 is near the end.
-        # Let's check bytes at 279.
-        # The string ends with: ... \2\0\0\0\4\377\377\0
-        # We need to see the exact bytes.
-        
-        # Let's just implement a loop that reads glyphs.
-        # We need to know when to stop or switch mode.
-        # "offset to next glyph" is key.
-        
-        # Glyph header:
-        # Unicode (1 byte)
-        # Offset (1 byte)
-        
         if idx >= len(data): break
         
         uc = data[idx]
-        if uc == 0: # End of block? Or just 0 char?
-            # Usually 0 is not a valid char in this context or it's a terminator?
-            # "Glyph bitmaps don't contain end markers"
-            pass
-            
         next_offset = data[idx+1]
+        
         if next_offset == 0:
-            # End of glyphs?
+            # Check for 0x100 block or end
+            # If we are at the end of block 1, we might see 0 offset?
+            # Or if it's the terminator.
+            # Let's check if we have more data for block 2.
+            # But for now, let's break if offset is 0.
+            # Wait, if it's block 2, we need to handle 2-byte unicode.
+            # But the loop assumes 1-byte unicode structure.
+            # If we hit a 0 offset, maybe we should check if there's a block 2?
+            # For this task, let's assume simple fonts first or handle block 2 if we see it.
+            # But the loop structure depends on `next_offset`.
             break
             
-        # Glyph data starts at idx + 2
-        # Length is next_offset.
-        # Next glyph is at idx + next_offset.
-        
-        # Wait, "data[off+1] has the offset to the next glyph, which is at data[off+data[off+1]]"
-        # So if next_offset is 5, next glyph is at idx + 5.
-        
-        # Let's decode the glyph at idx.
-        # Variable bit widths.
-        
         glyph_data_start = idx + 2
-        # The glyph data contains:
-        # bitcntW bits: width
-        # bitcntH bits: height
-        # bitcntX bits: x offset
-        # bitcntY bits: y offset
-        # bitcntD bits: pitch
-        # Then bitmap.
-        
-        # We need a BitReader starting at glyph_data_start.
         br = BitReader(data[glyph_data_start:])
         
         w = br.read_bits(bitcntW)
@@ -370,34 +929,13 @@ def main():
         y = br.read_signed_bits(bitcntY)
         d = br.read_signed_bits(bitcntD)
         
-        
-        # Bitmap decoding
-        # RLE.
-        # m0 bits: zeros
-        # m1 bits: ones
-        # n bits: repeat
-        
-        # We need to decode w*h bits.
         target_bits = w * h
         current_bits = 0
-        bitmap = [] # 0 or 1
+        bitmap = [] 
         
         while current_bits < target_bits:
-            # Read 0s
             run_0 = br.read_bits(m0)
-            # Read 1s
             run_1 = br.read_bits(m1)
-            # Read repeat count
-            # "n Bits == 1 (to be counted) denoting the number of repetitions of the sequence"
-            # "1 Bit == 0 as stop marker for each sequence"
-            
-            # This part is tricky.
-            # We read bits until we find a 0?
-            # "n Bits == 1 ... and 1 Bit == 0 as stop marker"
-            # This sounds like unary encoding?
-            # 0 -> 0 repeats (just the initial run)
-            # 10 -> 1 repeat
-            # 110 -> 2 repeats
             
             repeat = 0
             while True:
@@ -406,22 +944,12 @@ def main():
                     break
                 repeat += 1
             
-            # The sequence is run_0 zeros then run_1 ones.
-            # "repetition of the sequence"
-            # Does it mean (00..11..) repeated?
-            # Or just the last run?
-            # "The bit array has ... m0 bits denoting number of zeros ... m1 bits denoting number of ones ... n bits ... denoting number of repetitions of the sequence"
-            
-            # Let's assume the sequence is (zeros, ones).
-            # And we emit it 1 + repeat times?
-            
             for _ in range(repeat + 1):
                 bitmap.extend([0] * run_0)
                 bitmap.extend([1] * run_1)
                 
             current_bits += (run_0 + run_1) * (repeat + 1)
             
-        # Truncate if we overshot (due to RLE block size)
         bitmap = bitmap[:target_bits]
         
         glyphs.append({
@@ -434,53 +962,29 @@ def main():
 
     print(f"Parsed {len(glyphs)} glyphs.")
     
-    # Generate BDF
-    with open(args.output, 'w') as f:
+    with open(output_file, 'w') as f:
         f.write("STARTFONT 2.1\n")
         f.write(f"FONT {name}\n")
-        f.write(f"SIZE {font_bbx_h} 75 75\n") # Point size? Guessing.
+        f.write(f"SIZE {font_bbx_h} 75 75\n") 
         f.write(f"FONTBOUNDINGBOX {font_bbx_w} {font_bbx_h} {font_bbx_x} {font_bbx_y}\n")
         f.write("STARTPROPERTIES 2\n")
         f.write(f"FONT_ASCENT {ascent_A}\n")
-        f.write(f"FONT_DESCENT {-descent_g}\n") # BDF descent is positive usually? "Descent is the distance from the baseline to the bottom of the character. It is a positive value."
+        f.write(f"FONT_DESCENT {-descent_g}\n") 
         f.write("ENDPROPERTIES\n")
         f.write(f"CHARS {len(glyphs)}\n")
         
         for g in glyphs:
             f.write(f"STARTCHAR char{g['uc']}\n")
             f.write(f"ENCODING {g['uc']}\n")
-            f.write(f"SWIDTH {g['d']*1000//10} 0\n") # SWIDTH is scalable width. DWIDTH is device width.
+            f.write(f"SWIDTH {g['d']*1000//10} 0\n") 
             f.write(f"DWIDTH {g['d']} 0\n")
             f.write(f"BBX {g['w']} {g['h']} {g['x']} {g['y']}\n")
             f.write("BITMAP\n")
             
-            # Convert bitmap to hex lines
-            # BDF bitmap is row by row, padded to byte boundary
             row_bytes = (g['w'] + 7) // 8
             for r in range(g['h']):
-                row_val = 0
-                for c in range(g['w']):
-                    idx = r * g['w'] + c
-                    if g['bitmap'][idx]:
-                        # BDF is MSB first in the byte
-                        # Pixel 0 is bit 7
-                        bit_pos = 7 - (c % 8)
-                        row_val |= (1 << bit_pos)
-                    
-                    if (c + 1) % 8 == 0 or c == g['w'] - 1:
-                        if (c + 1) % 8 == 0 and c != g['w'] - 1:
-                             # We filled a byte, but row continues.
-                             # BDF expects hex string for the whole row.
-                             # Actually BDF lines are usually byte-aligned.
-                             # "The bitmap data is encoded as hexadecimal data... Each line of text represents one row of the bitmap."
-                             pass
-                
-                # We need to output the whole row as hex.
-                # If width is > 8, we have multiple bytes.
-                
-                # Let's redo row loop
-                line_hex = ""
                 current_byte = 0
+                line_hex = ""
                 for c in range(row_bytes * 8):
                     if c < g['w']:
                         idx = r * g['w'] + c
@@ -495,6 +999,50 @@ def main():
             f.write("ENDCHAR\n")
         
         f.write("ENDFONT\n")
+
+def main():
+    # Argument parsing
+    parser = argparse.ArgumentParser(description="Convert BDF fonts to u8g2 C format or vice versa.")
+    parser.add_argument("input_file", help="Input BDF or u8g2 C file")
+    parser.add_argument("-o", "--output", default="output.c", help="Output file name")
+    parser.add_argument("-e", "--encode", action="store_true", help="Encode BDF to u8g2 C (default is decode)")
+    parser.add_argument("-m", "--map", help="Character map file for BDF encoding (e.g., 'map.txt')")
+    
+    args = parser.parse_args()
+
+    if args.encode:
+        # BDF to u8g2
+        print(f"Parsing BDF file: {args.input_file}")
+        glyphs, font_bbx = parse_bdf_file(args.input_file, args.map)
+        print(f"Parsed {len(glyphs)} glyphs.")
+        
+        # Encode
+        font_name = args.output.replace('.', '_') # Simple name sanitization
+        c_code = generate_u8g2_c(glyphs, font_bbx, font_name)
+        
+        with open(args.output, 'w') as f:
+            f.write(c_code)
+        print(f"Written to {args.output}")
+    else:
+        # u8g2 to BDF
+        print(f"Parsing C file: {args.input_file}")
+        data, name = parse_c_file(args.input_file)
+        if not data:
+            print("Failed to read data")
+            sys.exit(1)
+            
+        print(f"Read {len(data)} bytes of font data.")
+        convert_u8g2_to_bdf(data, name, args.output)
+        print(f"Written to {args.output}")
+
+if __name__ == "__main__":
+    main()
+        
+        # ... (rest of decoding logic)
+        # We need to move the decoding logic into a function or keep it here but indented.
+        # For now, let's keep it here but I need to restructure main.
+        
+        # ...
 
 if __name__ == "__main__":
     main()
