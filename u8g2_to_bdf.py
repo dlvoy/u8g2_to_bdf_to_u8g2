@@ -2,6 +2,151 @@ import sys
 import re
 import argparse
 
+# PostScript character name to Unicode mapping for common characters
+# Based on Adobe Glyph List and common PostScript names
+POSTSCRIPT_TO_UNICODE = {
+    # Polish characters
+    'aogonek': 0x0105,  # ą
+    'Aogonek': 0x0104,  # Ą
+    'cacute': 0x0107,   # ć
+    'Cacute': 0x0106,   # Ć
+    'eogonek': 0x0119,  # ę
+    'Eogonek': 0x0118,  # Ę
+    'lslash': 0x0142,   # ł
+    'Lslash': 0x0141,   # Ł
+    'nacute': 0x0144,   # ń
+    'Nacute': 0x0143,   # Ń
+    'oacute': 0x00F3,   # ó
+    'Oacute': 0x00D3,   # Ó
+    'sacute': 0x015B,   # ś
+    'Sacute': 0x015A,   # Ś
+    'zacute': 0x017A,   # ź
+    'Zacute': 0x0179,   # Ź
+    'zdotaccent': 0x017C,  # ż
+    'Zdotaccent': 0x017B,  # Ż
+    
+    # Common Latin Extended characters
+    'aacute': 0x00E1,
+    'Aacute': 0x00C1,
+    'acircumflex': 0x00E2,
+    'Acircumflex': 0x00C2,
+    'adieresis': 0x00E4,
+    'Adieresis': 0x00C4,
+    'agrave': 0x00E0,
+    'Agrave': 0x00C0,
+    'aring': 0x00E5,
+    'Aring': 0x00C5,
+    'atilde': 0x00E3,
+    'Atilde': 0x00C3,
+    'ae': 0x00E6,
+    'AE': 0x00C6,
+    'ccedilla': 0x00E7,
+    'Ccedilla': 0x00C7,
+    'eacute': 0x00E9,
+    'Eacute': 0x00C9,
+    'ecircumflex': 0x00EA,
+    'Ecircumflex': 0x00CA,
+    'edieresis': 0x00EB,
+    'Edieresis': 0x00CB,
+    'egrave': 0x00E8,
+    'Egrave': 0x00C8,
+    'iacute': 0x00ED,
+    'Iacute': 0x00CD,
+    'icircumflex': 0x00EE,
+    'Icircumflex': 0x00CE,
+    'idieresis': 0x00EF,
+    'Idieresis': 0x00CF,
+    'igrave': 0x00EC,
+    'Igrave': 0x00CC,
+    'ntilde': 0x00F1,
+    'Ntilde': 0x00D1,
+    'oslash': 0x00F8,
+    'Oslash': 0x00D8,
+    'otilde': 0x00F5,
+    'Otilde': 0x00D5,
+    'scaron': 0x0161,
+    'Scaron': 0x0160,
+    'uacute': 0x00FA,
+    'Uacute': 0x00DA,
+    'ucircumflex': 0x00FB,
+    'Ucircumflex': 0x00DB,
+    'udieresis': 0x00FC,
+    'Udieresis': 0x00DC,
+    'ugrave': 0x00F9,
+    'Ugrave': 0x00D9,
+    'yacute': 0x00FD,
+    'Yacute': 0x00DD,
+    'ydieresis': 0x00FF,
+    'zcaron': 0x017E,
+    'Zcaron': 0x017D,
+    
+    # Special characters
+    'space': 0x0020,
+    'exclam': 0x0021,
+    'quotedbl': 0x0022,
+    'numbersign': 0x0023,
+    'dollar': 0x0024,
+    'percent': 0x0025,
+    'ampersand': 0x0026,
+    'quotesingle': 0x0027,
+    'parenleft': 0x0028,
+    'parenright': 0x0029,
+    'asterisk': 0x002A,
+    'plus': 0x002B,
+    'comma': 0x002C,
+    'hyphen': 0x002D,
+    'period': 0x002E,
+    'slash': 0x002F,
+    'colon': 0x003A,
+    'semicolon': 0x003B,
+    'less': 0x003C,
+    'equal': 0x003D,
+    'greater': 0x003E,
+    'question': 0x003F,
+    'at': 0x0040,
+    'bracketleft': 0x005B,
+    'backslash': 0x005C,
+    'bracketright': 0x005D,
+    'asciicircum': 0x005E,
+    'underscore': 0x005F,
+    'grave': 0x0060,
+    'braceleft': 0x007B,
+    'bar': 0x007C,
+    'braceright': 0x007D,
+    'asciitilde': 0x007E,
+}
+
+def char_name_to_unicode(char_name):
+    """
+    Convert character name to Unicode codepoint.
+    Handles three formats:
+    1. U+XXXX format (e.g., U+0104)
+    2. PostScript names (e.g., Aogonek, cacute, lslash)
+    3. uni+XXXX format (alternative Unicode format)
+    
+    Returns: Unicode codepoint as int, or None if not found
+    """
+    if not char_name:
+        return None
+    
+    # Try U+XXXX format
+    if char_name.startswith('U+'):
+        try:
+            return int(char_name[2:], 16)
+        except ValueError:
+            pass
+    
+    # Try uni+XXXX format (alternative)
+    if char_name.startswith('uni'):
+        try:
+            return int(char_name[3:], 16)
+        except ValueError:
+            pass
+    
+    # Try PostScript name mapping
+    return POSTSCRIPT_TO_UNICODE.get(char_name)
+
+
 class BitReader:
     def __init__(self, data):
         self.data = data
@@ -166,6 +311,7 @@ def parse_bdf_file(filepath, map_range=None):
     
     glyphs = []
     current_glyph = None
+    current_char_name = None
     in_bitmap = False
     
     for line in lines:
@@ -182,9 +328,27 @@ def parse_bdf_file(filepath, map_range=None):
             font_bbx['descent'] = int(line.split()[1])
         elif line.startswith("STARTCHAR"):
             current_glyph = {'bitmap_hex': []}
+            current_char_name = line.split(None, 1)[1] if len(line.split()) > 1 else None
             in_bitmap = False
         elif line.startswith("ENCODING"):
-            if current_glyph: current_glyph['uc'] = int(line.split()[1])
+            if current_glyph:
+                encoding = int(line.split()[1])
+                
+                # Handle different encoding types
+                if encoding >= 0:
+                    # Standard Unicode encoding
+                    current_glyph['uc'] = encoding
+                elif encoding == -1:
+                    # ENCODING -1: need to extract Unicode from character name
+                    # Supports: U+XXXX, uni+XXXX, and PostScript names
+                    unicode_value = char_name_to_unicode(current_char_name)
+                    
+                    if unicode_value is not None:
+                        current_glyph['uc'] = unicode_value
+                    else:
+                        # Unknown character, skip it
+                        print(f"Warning: Could not determine Unicode for character '{current_char_name}' with ENCODING -1")
+                        current_glyph = None
         elif line.startswith("DWIDTH"):
             if current_glyph: current_glyph['d'] = int(line.split()[1])
         elif line.startswith("BBX"):
@@ -198,7 +362,7 @@ def parse_bdf_file(filepath, map_range=None):
             in_bitmap = True
         elif line.startswith("ENDCHAR"):
             in_bitmap = False
-            if current_glyph:
+            if current_glyph and 'uc' in current_glyph:
                 if not map_range or current_glyph['uc'] in allowed_codepoints:
                     # Process bitmap
                     flat_bitmap = []
@@ -240,18 +404,40 @@ def parse_bdf_file(filepath, map_range=None):
                     current_glyph['bitmap'] = final_bitmap
                     del current_glyph['bitmap_hex']
                     
-                    # Skip empty glyphs (all zeros or zero dimensions)
+                    # Skip empty glyphs (all zeros or zero dimensions), but keep space character (32)
+                    is_space = (current_glyph['uc'] == 32)
                     is_empty = (current_glyph['w'] == 0 or 
                                current_glyph['h'] == 0 or 
                                all(bit == 0 for bit in final_bitmap))
                     
-                    if not is_empty:
+                    if not is_empty or is_space:
                         glyphs.append(current_glyph)
-                current_glyph = None
+            current_glyph = None
+            current_char_name = None
         else:
             if in_bitmap and current_glyph:
                 current_glyph['bitmap_hex'].append(line)
                 
+    # Print statistics about parsed glyphs
+    if glyphs:
+        unicode_ranges = {}
+        for g in glyphs:
+            uc = g['uc']
+            if uc < 128:
+                unicode_ranges['ASCII (0-127)'] = unicode_ranges.get('ASCII (0-127)', 0) + 1
+            elif uc < 256:
+                unicode_ranges['Latin-1 (128-255)'] = unicode_ranges.get('Latin-1 (128-255)', 0) + 1
+            elif uc < 0x0180:
+                unicode_ranges['Latin Extended-A (0x100-0x17F)'] = unicode_ranges.get('Latin Extended-A (0x100-0x17F)', 0) + 1
+            elif uc < 0x0250:
+                unicode_ranges['Latin Extended-B (0x180-0x24F)'] = unicode_ranges.get('Latin Extended-B (0x180-0x24F)', 0) + 1
+            else:
+                unicode_ranges[f'Other (0x{uc:04X})'] = unicode_ranges.get(f'Other (0x{uc:04X})', 0) + 1
+        
+        print(f"Parsed {len(glyphs)} glyphs from BDF:")
+        for range_name, count in sorted(unicode_ranges.items()):
+            print(f"  {range_name}: {count} glyphs")
+    
     return glyphs, font_bbx
 
 def main():
@@ -896,28 +1082,24 @@ def convert_u8g2_to_bdf(data, name, output_file):
     descent_g = data[14] 
     if descent_g > 127: descent_g -= 256 # Signed byte
     
-    # ... offsets ...
+    # Get offset to Unicode block (glyphs > 255)
+    offset_100 = (data[21] << 8) | data[22]
     
+    # Parse Block 1: glyphs with unicode <= 255
     idx = 23
     glyphs = []
     
-    while idx < len(data):
-        if idx >= len(data): break
+    # Determine where Block 1 ends (either at offset_100 or when we hit 0 offset)
+    block1_end = 23 + offset_100 if offset_100 > 0 else len(data)
+    
+    while idx < block1_end and idx < len(data):
+        if idx + 1 >= len(data): break
         
         uc = data[idx]
         next_offset = data[idx+1]
         
         if next_offset == 0:
-            # Check for 0x100 block or end
-            # If we are at the end of block 1, we might see 0 offset?
-            # Or if it's the terminator.
-            # Let's check if we have more data for block 2.
-            # But for now, let's break if offset is 0.
-            # Wait, if it's block 2, we need to handle 2-byte unicode.
-            # But the loop assumes 1-byte unicode structure.
-            # If we hit a 0 offset, maybe we should check if there's a block 2?
-            # For this task, let's assume simple fonts first or handle block 2 if we see it.
-            # But the loop structure depends on `next_offset`.
+            # End of Block 1
             break
             
         glyph_data_start = idx + 2
@@ -960,7 +1142,110 @@ def convert_u8g2_to_bdf(data, name, output_file):
         
         idx += next_offset
 
-    print(f"Parsed {len(glyphs)} glyphs.")
+    # Parse Block 2: glyphs with unicode > 255
+    if offset_100 > 0 and (23 + offset_100) < len(data):
+        idx = 23 + offset_100
+        
+        # Skip jump table if present (u8g2 v2.23+)
+        # Jump table entries are: offset(2) + unicode(2)
+        # Last entry has unicode = 0xFFFF
+        # We need to find the actual glyph data start
+        
+        # Simple heuristic: check if we're at a jump table
+        # Jump table has predictable structure, glyph data doesn't
+        # For now, assume no jump table or handle it simply
+        
+        # Try to detect jump table: if first 2 bytes look like an offset
+        # and bytes 2-3 look like a unicode value, it might be a jump table
+        if idx + 4 < len(data):
+            potential_offset = (data[idx] << 8) | data[idx + 1]
+            potential_unicode = (data[idx + 2] << 8) | data[idx + 3]
+            
+            # If potential_offset points within our data and potential_unicode looks valid
+            if potential_offset > 0 and potential_offset < 1000 and potential_unicode < 0xFFFF:
+                # Likely a jump table, skip to the glyph data
+                # Find the end of jump table (entry with unicode 0xFFFF)
+                jump_idx = idx
+                while jump_idx + 4 <= len(data):
+                    jump_unicode = (data[jump_idx + 2] << 8) | data[jump_idx + 3]
+                    if jump_unicode == 0xFFFF:
+                        # Found end of jump table
+                        jump_offset = (data[jump_idx] << 8) | data[jump_idx + 1]
+                        idx = jump_idx + jump_offset
+                        break
+                    jump_idx += 4
+        
+        # Now parse Block 2 glyphs (2-byte unicode)
+        while idx + 2 < len(data):
+            # Unicode is 2 bytes in Block 2
+            uc = (data[idx] << 8) | data[idx + 1]
+            
+            if idx + 2 >= len(data): break
+            next_offset = data[idx + 2]
+            
+            if next_offset == 0 or uc == 0xFFFF:
+                # End of glyphs
+                break
+            
+            glyph_data_start = idx + 3
+            br = BitReader(data[glyph_data_start:])
+            
+            w = br.read_bits(bitcntW)
+            h = br.read_bits(bitcntH)
+            x = br.read_signed_bits(bitcntX)
+            y = br.read_signed_bits(bitcntY)
+            d = br.read_signed_bits(bitcntD)
+            
+            target_bits = w * h
+            current_bits = 0
+            bitmap = []
+            
+            while current_bits < target_bits:
+                run_0 = br.read_bits(m0)
+                run_1 = br.read_bits(m1)
+                
+                repeat = 0
+                while True:
+                    bit = br.read_bits(1)
+                    if bit == 0:
+                        break
+                    repeat += 1
+                
+                for _ in range(repeat + 1):
+                    bitmap.extend([0] * run_0)
+                    bitmap.extend([1] * run_1)
+                    
+                current_bits += (run_0 + run_1) * (repeat + 1)
+                
+            bitmap = bitmap[:target_bits]
+            
+            glyphs.append({
+                'uc': uc,
+                'w': w, 'h': h, 'x': x, 'y': y, 'd': d,
+                'bitmap': bitmap
+            })
+            
+            idx += next_offset
+
+    # Print statistics
+    if glyphs:
+        unicode_ranges = {}
+        for g in glyphs:
+            uc = g['uc']
+            if uc < 128:
+                unicode_ranges['ASCII (0-127)'] = unicode_ranges.get('ASCII (0-127)', 0) + 1
+            elif uc < 256:
+                unicode_ranges['Latin-1 (128-255)'] = unicode_ranges.get('Latin-1 (128-255)', 0) + 1
+            elif uc < 0x0180:
+                unicode_ranges['Latin Extended-A (0x100-0x17F)'] = unicode_ranges.get('Latin Extended-A (0x100-0x17F)', 0) + 1
+            elif uc < 0x0250:
+                unicode_ranges['Latin Extended-B (0x180-0x24F)'] = unicode_ranges.get('Latin Extended-B (0x180-0x24F)', 0) + 1
+            else:
+                unicode_ranges[f'Other (0x{uc:04X})'] = unicode_ranges.get(f'Other (0x{uc:04X})', 0) + 1
+        
+        print(f"Parsed {len(glyphs)} glyphs:")
+        for range_name, count in sorted(unicode_ranges.items()):
+            print(f"  {range_name}: {count} glyphs")
     
     with open(output_file, 'w') as f:
         f.write("STARTFONT 2.1\n")
